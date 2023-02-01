@@ -36,7 +36,7 @@ def local_adversarial_loss(y_true, y_pred):
     truth = tf.reshape(y_true, (-1, 2))
     predicted = tf.reshape(y_pred, (-1, 2))
     
-    computed_loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=truth, logits=predicted)
+    computed_loss = tf.nn.softmax_cross_entropy_with_logits(labels=truth, logits=predicted)
     output = tf.reduce_mean(computed_loss)
     
     return output
@@ -114,7 +114,7 @@ disc.trainabler = False
 combined_model.compile(loss=[self_regularisation_loss, local_adversarial_loss], optimizer=SGD(lr=0.001))
 #################################
 path = os.path.dirname(os.path.abspath('.'))
-data_dir = os.path.join('.', 'input')
+data_dir = os.path.join('.', 'drive/MyDrive/Colab Notebooks/input')
 cache_dir = '.'
 ################################
 # load the data file and extract dimentions
@@ -219,7 +219,7 @@ assert y_refined.shape == (batch_size, disc_output_shape[1], 2)
 
 batch_out = get_image_batch(syn_gen)
 assert batch_out.shape == (batch_size, img_height, img_width, channels), "Image dimension do not match, {} != {}" \
-    .format(batch_out.shape, (batch_size, img_height, img_width, img_channels))
+    .format(batch_out.shape, (batch_size, img_height, img_width, channels))
 ##################################
 def pretrain_gen(steps, log_interval, save_path, profiling=True):
     losses = []
@@ -306,7 +306,8 @@ else:
 #######################################
 ihb = ImageHistoryBuffer((0, img_height, img_width, channels), batch_size*100, batch_size)
 
-gan_loss = np.zeros(shape=len(combined_model.metrics_names))
+#gan_loss = np.zeros(shape=len(combined_model.metrics_names))
+gan_loss = np.zeros(shape=(3,))
 disc_loss_real = 0.
 disc_loss_refined = 0.
 disc_loss = 0.
