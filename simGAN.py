@@ -199,8 +199,6 @@ datagen = image.ImageDataGenerator(preprocessing_function=applications.xception.
 syn_gen = datagen.flow(x=syn_img_stack, batch_size=batch_size)
 real_gen = datagen.flow(x=real_img_stack, batch_size=batch_size)
 ##################################
-disc_output_shape = disc.output_shape
-##################################
 def get_image_batch(generator):
         """keras generators may generate an incomplete batch for the last batch"""
         img_batch = generator.next()
@@ -210,6 +208,18 @@ def get_image_batch(generator):
         assert len(img_batch) == batch_size
 
         return img_batch
+##################################
+disc_output_shape = disc.output_shape
+##################################
+y_real = np.array([[[1.0, 0.0]] * disc_output_shape[1]] * batch_size)
+y_refined = np.array([[[0.0, 1.0]] * disc_output_shape[1]] * batch_size)
+
+assert y_real.shape == (batch_size, disc_output_shape[1], 2)
+assert y_refined.shape == (batch_size, disc_output_shape[1], 2)
+
+batch_out = get_image_batch(syn_gen)
+assert batch_out.shape == (batch_size, img_height, img_width, channels), "Image dimension do not match, {} != {}" \
+    .format(batch_out.shape, (batch_size, img_height, img_width, img_channels))
 ##################################
 def pretrain_gen(steps, log_interval, save_path, profiling=True):
     losses = []
@@ -253,3 +263,110 @@ if os.path.isfile(pre_gen_path):
 else:
     losses = pretrain_gen(gen_pre_steps, gen_log_interval, pre_gen_path)
     plt.plot(range(gen_log_interval, gen_pre_steps+1, gen_log_interval), losses)
+#######################################
+def pretrain_disc(steps, log_interval, save_path, profiling=True):
+    losses = []
+    disc_loss = 0.
+    if profiling:
+        start = time.perf_counter()
+    for i in range(steps):
+        real_imgs_batch = get_image_batch(real_gen)
+        disc_real_loss = disc.train_on_batch(real_imgs_batch, y_real)
+        
+        syn_imgs_batch = get_image_batch(syn_gen)
+        disc_refined_loss = disc.train_on_batch(syn_imgs_batch, y_refined)
+        
+        disc_loss += 0.5 * np.add(disc_real_loss, disc_refined_loss)
+
+        if (i+1) % log_interval == 0:
+            print('pre-training discriminator step {}/{}: loss = {:.5f}'.format(i+1, steps, disc_loss / log_interval))
+            losses.append(disc_loss / log_interval)
+            disc_loss = 0.
+
+    if profiling:
+        duration = time.perf_counter() - start
+        print('pre-training the discriminator model for {} steps lasted = {:.2f} minutes = {:.2f} hours'.format(steps, duration/60., duration/3600.))
+    
+    disc.save(save_path)
+    
+    return losses
+####################################
+    # and Dφ for 200 steps (one mini-batch for refined images, another for real)
+disc_pre_steps = 200
+disc_log_interval = 20
+
+pre_disc_path = os.path.join(cache_dir, 'disc_model_pre_trained_{}.h5'.format(disc_pre_steps))
+
+if os.path.isfile(pre_disc_path):
+    print('loading pretrained model weights')
+    disc.load_weights(pre_disc_path)
+else:
+    losses = pretrain_disc(disc_pre_steps, disc_log_interval, pre_disc_path)
+    plt.plot(range(disc_log_interval, disc_pre_steps+1, disc_log_interval), losses)
+#######################################
+ihb = ImageHistoryBuffer((0, img_height, img_width, channels), batch_size*100, batch_size)
+
+gan_loss = np.zeros(shape=len(combined_model.metrics_names))
+disc_loss_real = 0.
+disc_loss_refined = 0.
+disc_loss = 0.
+#######################################
+nb_steps = 2000 # originally 10000
+k_d = 1 # number of discriminator updates per step
+k_g = 2 # number of generator updates per step
+log_interval = 40
+######################################
+# see Algorithm 1 in https://arxiv.org/pdf/1612.07828v1.pdf
+for i in range(nb_steps):    
+    # train the refiner
+    for _ in range(k_g * 2):
+        # sample a mini-batch of synthetic images
+        syn_img_batch = get_image_batch(syn_gen)
+        # update θ by taking an SGD step on mini-batch loss LR(θ)
+        loss = combined_model.train_on_batch(syn_img_batch, [syn_img_batch, y_real])
+        gan_loss = np.add(gan_loss, loss)
+    
+    for _ in range(k_d):
+        # sample a mini-batch of synthetic and real images
+        syn_img_batch = get_image_batch(syn_gen)
+        real_img_batch = get_image_batch(real_gen)
+        
+        # refine the synthetic images w/ the current refiner
+        refined_img_batch = refiner.predict_on_batch(syn_img_batch)
+        
+        # use a history of refined images
+        history_img_half_batch = ihb.get_from_image_history_buffer()
+        ihb.add_to_history_img_buffer(refined_img_batch)
+        
+        if len(history_img_half_batch):
+            refined_img_batch[:batch_size//2] = history_img_half_batch
+        
+        # update φ by taking an SGD step on mini-batch loss LD(φ)
+        real_loss = disc.train_on_batch(real_img_batch, y_real)
+        disc_loss_real += real_loss
+        ref_loss = disc.train_on_batch(refined_img_batch, y_refined)
+        disc_loss_refined += ref_loss
+        disc_loss += 0.5 * (real_loss + ref_loss)
+    
+    if (i+1) % log_interval == 0:
+        print('step: {}/{} | [D loss: (real) {:.5f} / (refined) {:.5f} / (combined) {:.5f}]'.format(i+1, 
+                      nb_steps, disc_loss_real/log_interval, disc_loss_refined/log_interval,  disc_loss/log_interval))
+        
+        gan_loss = np.zeros(shape=len(combined_model.metrics_names))
+        disc_loss_real = 0.
+        disc_loss_refined = 0.
+        disc_loss = 0.
+    
+    if (i+1) % (log_interval*5) == 0:
+        figure_name = 'refined_image_batch_step_{}.png'.format(i)
+        print('Saving batch of refined images at adversarial step: {}.'.format(i))
+        
+        synthetic_image_batch = get_image_batch(syn_gen)[:plotted_imgs]
+        plot_batch(
+            np.concatenate((synthetic_image_batch, refiner.predict_on_batch(synthetic_image_batch))),
+            os.path.join(cache_dir, figure_name),
+            label_batch=['Synthetic'] * plotted_imgs + ['Refined'] * plotted_imgs)
+###########################
+refiner.save(os.path.join(cache_dir, 'refiner_model.h5'.format(disc_pre_steps)))
+disc.save(os.path.join(cache_dir, 'disc_model.h5'.format(disc_pre_steps)))
+combined_model.save(os.path.join(cache_dir, 'simgan_model.h5'.format(disc_pre_steps)))
